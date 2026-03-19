@@ -1,0 +1,147 @@
+╔══════════════════════════════════════════════════════════════════════════════════════════════════╗
+║                    ScyllaDB CDC Infrastructure — Docker Bridge Network                          ║
+║                              Network: scylla-cdc-bridge                                         ║
+╚══════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+  ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+  │  HOST MACHINE  (Linux, x86_64)                                                              │
+  │                                                                                             │
+  │  Kernel Tuning (/etc/sysctl.d/99-scylla-cdc.conf)                                          │
+  │  ├── fs.aio-max-nr    = 2147483647  (INT_MAX — shared across all containers)               │
+  │  ├── net.core.somaxconn = 4096                                                              │
+  │  ├── vm.swappiness    = 1                                                                   │
+  │  ├── net.ipv4.tcp_rmem = 4096 87380 16777216                                               │
+  │  └── net.ipv4.tcp_wmem = 4096 65536 16777216                                               │
+  │                                                                                             │
+  │  /etc/hosts (managed block)                                                                 │
+  │  ├── 172.18.0.2  scylla-cdc-quickstart                                                     │
+  │  ├── 172.18.0.3  scylla-cdc-quickstart-2                                                   │
+  │  ├── 172.18.0.4  scylla-cdc-quickstart-3                                                   │
+  │  ├── 172.18.0.5  scylla-cdc-broker                                                         │
+  │  ├── 172.18.0.6  scylla-cdc-schema-registry                                                │
+  │  ├── 172.18.0.7  scylla-cdc-connect                                                        │
+  │  ├── 172.18.0.8  scylla-cdc-rest-proxy                                                     │
+  │  ├── 172.18.0.9  scylla-cdc-ksqldb                                                         │
+  │  └── 172.18.0.10 scylla-cdc-kafdrop / scylla-cdc-control-center                            │
+  │                                                                                             │
+  │  Host port access (1xxxx prefix avoids conflicts)                                           │
+  │  ├── localhost:19093  →  Kafka Broker                                                       │
+  │  ├── localhost:18081  →  Schema Registry                                                    │
+  │  ├── localhost:18083  →  Kafka Connect REST API                                             │
+  │  ├── localhost:18082  →  Kafka REST Proxy                                                   │
+  │  ├── localhost:18088  →  ksqlDB                                                             │
+  │  ├── localhost:19000  →  Kafdrop UI      (community edition)                                │
+  │  └── localhost:19021  →  Control Center  (enterprise edition)                               │
+  │                                                                                             │
+  │  ./volumes/connectors/                                                                      │
+  │  └── scylla-cdc-source-connector-<version>-jar-with-dependencies.jar                       │
+  │      (downloaded from Maven Central, bind-mounted into scylla-cdc-connect)                  │
+  │                                                                                             │
+  │ ┌───────────────────────────────────────────────────────────────────────────────────────┐  │
+  │ │  Docker Bridge Network: scylla-cdc-bridge  (172.18.0.0/16)                           │  │
+  │ │  Docker embedded DNS resolves all container hostnames within this network             │  │
+  │ │                                                                                       │  │
+  │ │  ┌─────────────────────── ScyllaDB Cluster ────────────────────────────────────────┐ │  │
+  │ │  │                                                                                  │ │  │
+  │ │  │  ┌────────────────────┐   gossip    ┌────────────────────┐                      │ │  │
+  │ │  │  │ scylla-cdc-        │◄──────────►│ scylla-cdc-        │                      │ │  │
+  │ │  │  │ quickstart         │             │ quickstart-2       │                      │ │  │
+  │ │  │  │ (seed node)        │   gossip    │                    │                      │ │  │
+  │ │  │  │                    │◄─────────────────────────────────►                      │ │  │
+  │ │  │  │ image: scylladb/   │             │ image: scylladb/   │                      │ │  │
+  │ │  │  │        scylla      │             │        scylla      │                      │ │  │
+  │ │  │  │ CQL: :9042         │             │ CQL: :9042         │                      │ │  │
+  │ │  │  │ Gossip: :7000      │             │ Gossip: :7000      │                      │ │  │
+  │ │  │  │ Storage: vnode/256 │             │ Storage: vnode/256 │                      │ │  │
+  │ │  │  └────────────────────┘             └────────────────────┘                      │ │  │
+  │ │  │           │                                    │                                 │ │  │
+  │ │  │           └──────────────┬─────────────────────┘                                │ │  │
+  │ │  │                          │ gossip                                                │ │  │
+  │ │  │               ┌────────────────────┐                                             │ │  │
+  │ │  │               │ scylla-cdc-        │                                             │ │  │
+  │ │  │               │ quickstart-3       │                                             │ │  │
+  │ │  │               │                   │                                             │ │  │
+  │ │  │               │ image: scylladb/   │                                             │ │  │
+  │ │  │               │        scylla      │                                             │ │  │
+  │ │  │               │ CQL: :9042         │                                             │ │  │
+  │ │  │               │ Gossip: :7000      │                                             │ │  │
+  │ │  │               └────────────────────┘                                             │ │  │
+  │ │  │                                                                                  │ │  │
+  │ │  │   Replication Factor: configurable (RF=3 recommended for production)             │ │  │
+  │ │  │   Partitioner: Murmur3                                                           │ │  │
+  │ │  │   Snitch: SimpleSnitch (datacenter1, rack1)                                      │ │  │
+  │ │  └──────────────────────────────────────────────────────────────────────────────────┘ │  │
+  │ │                                     │                                                 │  │
+  │ │             CQL :9042               │ CDC reads                                       │  │
+  │ │                                     ▼                                                 │  │
+  │ │  ┌──────────────────────────── Confluent Kafka Stack ────────────────────────────┐  │  │
+  │ │  │                                                                                │  │  │
+  │ │  │  ┌──────────────────────────────────────────────────────────────────────────┐ │  │  │
+  │ │  │  │  scylla-cdc-broker   (KRaft — combined broker + controller roles)        │ │  │  │
+  │ │  │  │                                                                          │ │  │  │
+  │ │  │  │  community : confluentinc/cp-kafka:7.6.1                                 │ │  │  │
+  │ │  │  │  enterprise: confluentinc/cp-server:7.6.1                                │ │  │  │
+  │ │  │  │                                                                          │ │  │  │
+  │ │  │  │  Listeners:                                                              │ │  │  │
+  │ │  │  │    PLAINTEXT      → :9092  (inter-container, bridge network)             │ │  │  │
+  │ │  │  │    CONTROLLER     → :29093 (KRaft quorum, internal only)                 │ │  │  │
+  │ │  │  │    PLAINTEXT_HOST → :9093  (host access via -p 19093:9093)               │ │  │  │
+  │ │  │  │                                                                          │ │  │  │
+  │ │  │  │  Internal topics (RF=1, single-node dev):                                │ │  │  │
+  │ │  │  │    scylla-cdc-connect-configs                                             │ │  │  │
+  │ │  │  │    scylla-cdc-connect-offsets                                             │ │  │  │
+  │ │  │  │    scylla-cdc-connect-status                                              │ │  │  │
+  │ │  │  │    _schemas  (Schema Registry)                                            │ │  │  │
+  │ │  │  └──────────────────────────────────────────────────────────────────────────┘ │  │  │
+  │ │  │           │                 ▲                 │                               │  │  │
+  │ │  │     :9092 │          :9092  │          :9092  │                               │  │  │
+  │ │  │           ▼                 │                 ▼                               │  │  │
+  │ │  │  ┌──────────────┐  ┌───────────────┐  ┌──────────────┐  ┌─────────────────┐ │  │  │
+  │ │  │  │  scylla-cdc- │  │  scylla-cdc-  │  │  scylla-cdc- │  │  scylla-cdc-    │ │  │  │
+  │ │  │  │  schema-     │  │  connect      │  │  rest-proxy  │  │  ksqldb         │ │  │  │
+  │ │  │  │  registry    │  │               │  │              │  │                 │ │  │  │
+  │ │  │  │              │  │ Plugins:      │  │ :8082        │  │ :8088           │ │  │  │
+  │ │  │  │ :8081        │  │  - Datagen    │  │              │  │                 │ │  │  │
+  │ │  │  │              │  │  - ScyllaDB   │  │ REST →       │  │ SQL over Kafka  │ │  │  │
+  │ │  │  │ Avro schema  │  │    CDC Source │  │ Kafka topics │  │                 │ │  │  │
+  │ │  │  │ evolution &  │  │    Connector  │  │              │  │                 │ │  │  │
+  │ │  │  │ compatibility│  │  (from Maven  │  │              │  │                 │ │  │  │
+  │ │  │  │              │  │   Central,    │  │              │  │                 │ │  │  │
+  │ │  │  │              │  │   /connectors)│  │              │  │                 │ │  │  │
+  │ │  │  └──────────────┘  └───────────────┘  └──────────────┘  └─────────────────┘ │  │  │
+  │ │  │         ▲                  │ CQL :9042                                        │  │  │
+  │ │  │         │ schema           └──────────────────────────────────────────────►   │  │  │
+  │ │  │         │ registration               ScyllaDB cluster (reads CDC log)         │  │  │
+  │ │  │         │                                                                     │  │  │
+  │ │  │  ┌──────────────────────────────────────────────────────────────────────────┐ │  │  │
+  │ │  │  │  Web UI                                                                  │ │  │  │
+  │ │  │  │                                                                          │ │  │  │
+  │ │  │  │  community : scylla-cdc-kafdrop (Kafdrop OSS)   → :9000 → host :19000   │ │  │  │
+  │ │  │  │  enterprise: scylla-cdc-control-center          → :9021 → host :19021   │ │  │  │
+  │ │  │  └──────────────────────────────────────────────────────────────────────────┘ │  │  │
+  │ │  └───────────────────────────────────────────────────────────────────────────────┘  │  │
+  │ └───────────────────────────────────────────────────────────────────────────────────────┘  │
+  └─────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  STARTUP ORDER
+  ─────────────
+  [1] scylla-cdc-quickstart    (seed — wait for UN state before proceeding)
+  [2] scylla-cdc-quickstart-2  (+30s after seed is UN)
+  [3] scylla-cdc-quickstart-3  (+30s after node 2 is UN)
+  [4] scylla-cdc-broker        (KRaft init with generated cluster ID)
+  [5] scylla-cdc-schema-registry
+  [6] scylla-cdc-connect       (Datagen installed at boot — community only)
+  [7] scylla-cdc-rest-proxy
+  [8] scylla-cdc-ksqldb
+  [9] scylla-cdc-kafdrop / scylla-cdc-control-center
+
+  NETWORKING RULES
+  ────────────────
+  • All containers share scylla-cdc-bridge
+  • Docker embedded DNS resolves hostnames within the network
+  • ScyllaDB nodes communicate over gossip (:7000) and CQL (:9042)
+  • Kafka Connect reaches ScyllaDB via scylla-cdc-quickstart:9042
+  • Kafka Connect reaches broker via scylla-cdc-broker:9092
+  • Host reaches all services via localhost:1xxxx port mappings
+  • /etc/hosts is updated with all container IPs for host-side hostname resolution
+

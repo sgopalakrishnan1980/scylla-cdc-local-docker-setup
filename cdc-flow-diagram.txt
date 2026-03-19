@@ -1,0 +1,265 @@
+╔══════════════════════════════════════════════════════════════════════════════════════════════════╗
+║            ScyllaDB → Kafka CDC Pipeline Flow                                                   ║
+║            ScyllaDB CDC Source Connector (Debezium-based)                                       ║
+╚══════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PART 1 — SCYLLADB: DATA TABLE + CDC LOG TABLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Application writes to a CDC-enabled table:
+
+  ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+  │  Keyspace: cdc_test                                                                         │
+  │                                                                                             │
+  │  CREATE TABLE cdc_test.orders (                                                             │
+  │      order_id   uuid,                                                                       │
+  │      customer   text,                                                                       │
+  │      product    text,                                                                       │
+  │      quantity   int,                                                                        │
+  │      status     text,                                                                       │
+  │      created_at timestamp,                                                                  │
+  │      PRIMARY KEY (order_id)                                                                 │
+  │  ) WITH cdc = {'enabled': true,                                                             │
+  │                'preimage': 'true',                 ← full row state BEFORE the change       │
+  │                'postimage': 'true'};               ← full row state AFTER the change        │
+  └─────────────────────────────────────────────────────────────────────────────────────────────┘
+                   │
+                   │  Every INSERT / UPDATE / DELETE on orders
+                   │  atomically appends a row to the CDC log table
+                   ▼
+  ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+  │  CDC Log Table (auto-created by ScyllaDB, same keyspace):                                   │
+  │                                                                                             │
+  │  TABLE: cdc_test.orders_scylla_cdc_log                                                      │
+  │                                                                                             │
+  │  Key columns (system-generated):                                                            │
+  │  ┌─────────────────────────────┬──────────────────────────────────────────────────────────┐ │
+  │  │ cdc$stream_id   timeuuid    │ Identifies which Vnode stream this row belongs to         │ │
+  │  │ cdc$time        timeuuid    │ Timestamp of the operation (used for ordering)            │ │
+  │  │ cdc$batch_seq   int         │ Position within a multi-row batch                         │ │
+  │  └─────────────────────────────┴──────────────────────────────────────────────────────────┘ │
+  │                                                                                             │
+  │  Operation columns:                                                                         │
+  │  ┌─────────────────────────────┬──────────────────────────────────────────────────────────┐ │
+  │  │ cdc$operation   tinyint     │ 1=PRE_IMAGE  2=INSERT  3=UPDATE  4=UPDATE_INSERT          │ │
+  │  │                             │ 5=DELETE     6=ROW_DELETE  7=PARTITION_DELETE             │ │
+  │  │ cdc$ttl         bigint      │ TTL of the source row (if set)                            │ │
+  │  │ cdc$end_of_batch boolean    │ true if this is the last row of the batch                 │ │
+  │  └─────────────────────────────┴──────────────────────────────────────────────────────────┘ │
+  │                                                                                             │
+  │  Data columns (mirrors the source table, each with a boolean "changed" companion):          │
+  │  ┌─────────────────────────────┬──────────────────────────────────────────────────────────┐ │
+  │  │ order_id                    │ Primary key — always present                              │ │
+  │  │ customer,  customer$deleted │ Value + was-it-deleted flag                               │ │
+  │  │ product,   product$deleted  │                                                           │ │
+  │  │ quantity,  quantity$deleted │                                                           │ │
+  │  │ status,    status$deleted   │                                                           │ │
+  │  │ created_at                  │                                                           │ │
+  │  └─────────────────────────────┴──────────────────────────────────────────────────────────┘ │
+  │                                                                                             │
+  │  Partitioned by: cdc$stream_id                                                              │
+  │  Clustered by:   cdc$time ASC, cdc$batch_seq ASC                                           │
+  │  TTL:            24 hours by default (configurable)                                        │
+  └─────────────────────────────────────────────────────────────────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PART 2 — CDC CONNECTOR INTERNALS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+  │  Container: scylla-cdc-connect                                                              │
+  │  JAR:       /connectors/scylla-cdc-source-connector-<version>-jar-with-dependencies.jar     │
+  │  Class:     com.scylladb.cdc.debezium.connector.ScyllaConnector                             │
+  │                                                                                             │
+  │  ┌──────────────────────────────────────────────────────────────────────────────────────┐   │
+  │  │  CONNECTOR REGISTRATION (POST /connectors)                                           │   │
+  │  │                                                                                      │   │
+  │  │  {                                                                                   │   │
+  │  │    "name": "scylla-cdc-orders",                                                      │   │
+  │  │    "config": {                                                                       │   │
+  │  │                                                                                      │   │
+  │  │      -- Core identity                                                                │   │
+  │  │      "connector.class":        "com.scylladb.cdc.debezium.connector.ScyllaConnector" │   │
+  │  │      "topic.prefix":           "ScyllaCDC"       ← prefixes all generated topics    │   │
+  │  │                                                                                      │   │
+  │  │      -- ScyllaDB connection                                                          │   │
+  │  │      "scylla.cluster.ip.addresses": "scylla-cdc-quickstart:9042,                    │   │
+  │  │                                      scylla-cdc-quickstart-2:9042,                  │   │
+  │  │                                      scylla-cdc-quickstart-3:9042"                  │   │
+  │  │      "scylla.localdc":         "datacenter1"     ← driver local DC awareness        │   │
+  │  │                                                                                      │   │
+  │  │      -- Table selection                                                              │   │
+  │  │      "scylla.table.names":     "cdc_test.orders" ← comma-separated ks.table pairs   │   │
+  │  │                                                                                      │   │
+  │  │      -- Parallelism                                                                  │   │
+  │  │      "tasks.max":              "3"               ← 1 task per ScyllaDB node          │   │
+  │  │                                                                                      │   │
+  │  │      -- Converters                                                                   │   │
+  │  │      "key.converter":          "org.apache.kafka.connect.json.JsonConverter"         │   │
+  │  │      "value.converter":        "org.apache.kafka.connect.json.JsonConverter"         │   │
+  │  │      "key.converter.schemas.enable":   "true"                                        │   │
+  │  │      "value.converter.schemas.enable": "true"                                        │   │
+  │  │                                                                                      │   │
+  │  │      -- Optional: preimage support (requires table WITH cdc = {'preimage':'true'})   │   │
+  │  │      "scylla.preimage":        "true"                                                │   │
+  │  │                                                                                      │   │
+  │  │      -- Optional: postimage support                                                  │   │
+  │  │      "scylla.postimage":       "true"                                                │   │
+  │  │                                                                                      │   │
+  │  │      -- Offset storage (progress checkpointing)                                     │   │
+  │  │      "offset.flush.interval.ms": "5000"                                             │   │
+  │  │    }                                                                                 │   │
+  │  │  }                                                                                   │   │
+  │  └──────────────────────────────────────────────────────────────────────────────────────┘   │
+  │                                                                                             │
+  │  Task splitting:                                                                            │
+  │  Each task owns a subset of ScyllaDB Vnodes (256 per node × 3 nodes = 768 total).          │
+  │  With tasks.max=3, each task reads ~256 Vnode CDC streams in parallel.                     │
+  └─────────────────────────────────────────────────────────────────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PART 3 — FULL DATA FLOW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌─────────┐   INSERT/UPDATE/DELETE   ┌──────────────────────────────────────────┐
+  │  App /  │ ─────────────────────► │  cdc_test.orders  (source table)         │
+  │  cqlsh  │                         │  ScyllaDB node — scylla-cdc-quickstart   │
+  └─────────┘                         └─────────────────────────────────────────┘
+                                                        │
+                                                        │ CDC log append (atomic, same partition)
+                                                        ▼
+                                       ┌─────────────────────────────────────────┐
+                                       │  cdc_test.orders_scylla_cdc_log         │
+                                       │  (auto-managed by ScyllaDB, TTL=24h)    │
+                                       └─────────────────────────────────────────┘
+                                                        │
+                                    CQL poll (per Vnode stream, by cdc$stream_id)
+                                    Progress saved to Kafka connect-offsets topic
+                                                        │
+                                                        ▼
+                              ┌────────────────────────────────────────────────────┐
+                              │  scylla-cdc-connect                                │
+                              │  ScyllaDB CDC Source Connector                     │
+                              │                                                    │
+                              │  Task 1: Vnodes  0–255   (node 1 tokens)           │
+                              │  Task 2: Vnodes 256–511  (node 2 tokens)           │
+                              │  Task 3: Vnodes 512–767  (node 3 tokens)           │
+                              │                                                    │
+                              │  For each CDC row:                                 │
+                              │    1. Read cdc$operation type                      │
+                              │    2. Build Debezium envelope:                     │
+                              │         before: {} (preimage if enabled)           │
+                              │         after:  {} (postimage / new values)        │
+                              │         source: {table, ts_ms, snapshot}           │
+                              │         op:     c(reate)/u(pdate)/d(elete)/r(ead)  │
+                              │    3. Apply SMT if configured                      │
+                              │         ScyllaExtractNewRecordState                │
+                              │         ScyllaFlattenColumns                       │
+                              │    4. Serialize with key/value converter           │
+                              └────────────────────────────────────────────────────┘
+                                                        │
+                                  publish to Kafka topic (auto-created)
+                                                        │
+                                                        ▼
+                              ┌────────────────────────────────────────────────────┐
+                              │  Kafka Topic: ScyllaCDC.cdc_test.orders            │
+                              │                                                    │
+                              │  Topic name pattern:                               │
+                              │    {topic.prefix}.{keyspace}.{table}               │
+                              │                                                    │
+                              │  Message key (JSON):                               │
+                              │  ┌──────────────────────────────────────────────┐  │
+                              │  │  {                                           │  │
+                              │  │    "schema": { "type": "struct", ... },      │  │
+                              │  │    "payload": {                              │  │
+                              │  │      "order_id": "550e8400-e29b-41d4-..."   │  │
+                              │  │    }                                         │  │
+                              │  │  }                                           │  │
+                              │  └──────────────────────────────────────────────┘  │
+                              │                                                    │
+                              │  Message value (Debezium envelope, JSON):          │
+                              │  ┌──────────────────────────────────────────────┐  │
+                              │  │  {                                           │  │
+                              │  │    "schema": { ... },                        │  │
+                              │  │    "payload": {                              │  │
+                              │  │      "before": {                             │  │
+                              │  │        "order_id": "550e8400...",            │  │
+                              │  │        "status":   "PENDING"                │  │
+                              │  │      },                                      │  │
+                              │  │      "after": {                              │  │
+                              │  │        "order_id": "550e8400...",            │  │
+                              │  │        "status":   "SHIPPED"                │  │
+                              │  │        "customer": "Alice",                 │  │
+                              │  │        "product":  "Laptop",                │  │
+                              │  │        "quantity": 1                        │  │
+                              │  │      },                                      │  │
+                              │  │      "source": {                             │  │
+                              │  │        "version":  "2.x.x",                 │  │
+                              │  │        "connector":"scylla",                 │  │
+                              │  │        "name":     "ScyllaCDC",              │  │
+                              │  │        "ts_ms":    1710000000000,            │  │
+                              │  │        "snapshot": "false",                  │  │
+                              │  │        "db":       "cdc_test",               │  │
+                              │  │        "table":    "orders"                  │  │
+                              │  │      },                                      │  │
+                              │  │      "op":    "u",                           │  │
+                              │  │      "ts_ms": 1710000000123                  │  │
+                              │  │    }                                         │  │
+                              │  │  }                                           │  │
+                              │  └──────────────────────────────────────────────┘  │
+                              └────────────────────────────────────────────────────┘
+                                                        │
+                                    downstream consumers subscribe here
+                                                        │
+                          ┌─────────────────────────────┴─────────────────────────────┐
+                          │                             │                              │
+                          ▼                             ▼                              ▼
+               ┌─────────────────┐          ┌──────────────────┐          ┌──────────────────┐
+               │  ksqlDB stream  │          │  Kafka Connect   │          │  Any Kafka       │
+               │  processing     │          │  Sink Connector  │          │  Consumer        │
+               │                 │          │  (Snowflake,     │          │  (Java, Python,  │
+               │  Real-time      │          │   Elasticsearch, │          │   Spark, Flink)  │
+               │  aggregations   │          │   S3, etc.)      │          │                  │
+               └─────────────────┘          └──────────────────┘          └──────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PART 4 — OFFSET TRACKING (FAULT TOLERANCE)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Each connector task checkpoints its Vnode stream position into Kafka's
+  internal offset storage topic (scylla-cdc-connect-offsets).
+
+  Offset key:   {connector-name} + {stream_id}
+  Offset value: {cdc$time of last successfully published row}
+
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  On restart, each task:                                          │
+  │  1. Reads its last committed offset from connect-offsets         │
+  │  2. Resumes querying CDC log from that cdc$time onwards          │
+  │  3. At-least-once delivery (duplicate filtering by consumer)     │
+  └──────────────────────────────────────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PART 5 — TABLETS ARCHITECTURE NOTE (ScyllaDB 2025.x)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ScyllaDB 2025.x introduced the tablets storage architecture.
+  Tablets dynamically rebalance token ranges across nodes — unlike
+  the fixed Vnode model the older connector versions were built against.
+
+  ┌────────────────────────────────────────────────────────┐
+  │  Vnode model (pre-2025):  fixed 256 tokens per node    │
+  │    → connector tasks mapped 1:1 to Vnode streams       │
+  │    → predictable, static assignment                    │
+  │                                                        │
+  │  Tablet model (2025.x+):  dynamic token migration      │
+  │    → tablet splits and merges during operation         │
+  │    → CDC stream IDs change on rebalance                │
+  │    → connector MUST be 2.0.x+ to handle this          │
+  └────────────────────────────────────────────────────────┘
+
+  The bootstrap script enforces this: if Maven Central resolves
+  a version below 2.0.0, a red WARNING banner fires and the script
+  pauses for 10 seconds before continuing.
+
