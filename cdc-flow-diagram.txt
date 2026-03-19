@@ -3,6 +3,48 @@
 ║            ScyllaDB CDC Source Connector (Debezium-based)                                       ║
 ╚══════════════════════════════════════════════════════════════════════════════════════════════════╝
 
+╔══════════════════════════════════════════════════════════════════════════════════════════════════╗
+║  !!  IMPORTANT — TABLETS ARCHITECTURE COMPATIBILITY (ScyllaDB 2025.x)                       !!  ║
+╠══════════════════════════════════════════════════════════════════════════════════════════════════╣
+║                                                                                                  ║
+║  ScyllaDB 2025.x introduced the tablets storage architecture. Tablets dynamically rebalance      ║
+║  token ranges across nodes — unlike the fixed Vnode model older connector versions relied on.    ║
+║                                                                                                  ║
+║  ┌─────────────────────────────────────────────────────────────────────────────────────────┐     ║
+║  │  Vnode model (pre-2025.x):  fixed 256 tokens per node                                  │     ║
+║  │    → connector tasks mapped 1:1 to Vnode streams                                       │     ║
+║  │    → predictable, static token assignment                                               │     ║
+║  │    → CDC stream IDs are stable for the lifetime of the cluster                         │     ║
+║  │                                                                                         │     ║
+║  │  Tablet model (2025.x+):   dynamic token migration                                     │     ║
+║  │    → tablets split and merge during normal operation                                    │     ║
+║  │    → CDC stream IDs change on every tablet rebalance                                   │     ║
+║  │    → connector MUST be version 2.0.x or higher to handle this correctly                │     ║
+║  └─────────────────────────────────────────────────────────────────────────────────────────┘     ║
+║                                                                                                  ║
+║  RISK TABLE                                                                                      ║
+║  ┌───────────────────┬──────────────────────────────────────────────────────────────────┐        ║
+║  │  Connector ver.   │  Behaviour against ScyllaDB 2025.x (tablets enabled)             │        ║
+║  ├───────────────────┼──────────────────────────────────────────────────────────────────┤        ║
+║  │  < 2.0.0          │  ✗  Crashes on tablet rebalance                                 │        ║
+║  │                   │  ✗  Silent data loss between splits/merges                       │        ║
+║  │                   │  ✗  Stale stream IDs cause missed CDC events                    │        ║
+║  ├───────────────────┼──────────────────────────────────────────────────────────────────┤        ║
+║  │  ≥ 2.0.0          │  ✓  Tablet-aware stream tracking                                │        ║
+║  │                   │  ✓  Handles splits/merges transparently                         │        ║
+║  │                   │  ✓  No data loss on rebalance                                   │        ║
+║  └───────────────────┴──────────────────────────────────────────────────────────────────┘        ║
+║                                                                                                  ║
+║  HOW THE BOOTSTRAP SCRIPT ENFORCES THIS                                                          ║
+║    • Resolves the latest version from Maven Central maven-metadata.xml at runtime               ║
+║    • Extracts the major version number from the resolved version string                         ║
+║    • If major < 2 → prints a full-screen red WARNING banner + 10-second countdown               ║
+║    • If major ≥ 2 → prints a green OK banner and proceeds                                       ║
+║    • The JAR is downloaded from:                                                                 ║
+║        https://repo1.maven.org/maven2/com/scylladb/scylla-cdc-source-connector/                 ║
+║                                                                                                  ║
+╚══════════════════════════════════════════════════════════════════════════════════════════════════╝
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   PART 1 — SCYLLADB: DATA TABLE + CDC LOG TABLE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -35,7 +77,7 @@
   │                                                                                             │
   │  Key columns (system-generated):                                                            │
   │  ┌─────────────────────────────┬──────────────────────────────────────────────────────────┐ │
-  │  │ cdc$stream_id   timeuuid    │ Identifies which Vnode stream this row belongs to         │ │
+  │  │ cdc$stream_id   timeuuid    │ Identifies which Vnode/tablet stream this row belongs to  │ │
   │  │ cdc$time        timeuuid    │ Timestamp of the operation (used for ordering)            │ │
   │  │ cdc$batch_seq   int         │ Position within a multi-row batch                         │ │
   │  └─────────────────────────────┴──────────────────────────────────────────────────────────┘ │
@@ -134,7 +176,7 @@
                                        │  (auto-managed by ScyllaDB, TTL=24h)    │
                                        └─────────────────────────────────────────┘
                                                         │
-                                    CQL poll (per Vnode stream, by cdc$stream_id)
+                                    CQL poll (per Vnode/tablet stream, by cdc$stream_id)
                                     Progress saved to Kafka connect-offsets topic
                                                         │
                                                         ▼
@@ -142,9 +184,9 @@
                               │  scylla-cdc-connect                                │
                               │  ScyllaDB CDC Source Connector                     │
                               │                                                    │
-                              │  Task 1: Vnodes  0–255   (node 1 tokens)           │
-                              │  Task 2: Vnodes 256–511  (node 2 tokens)           │
-                              │  Task 3: Vnodes 512–767  (node 3 tokens)           │
+                              │  Task 1: Tablets  0–255   (node 1 token range)     │
+                              │  Task 2: Tablets 256–511  (node 2 token range)     │
+                              │  Task 3: Tablets 512–767  (node 3 token range)     │
                               │                                                    │
                               │  For each CDC row:                                 │
                               │    1. Read cdc$operation type                      │
@@ -227,7 +269,7 @@
   PART 4 — OFFSET TRACKING (FAULT TOLERANCE)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  Each connector task checkpoints its Vnode stream position into Kafka's
+  Each connector task checkpoints its Vnode/tablet stream position into Kafka's
   internal offset storage topic (scylla-cdc-connect-offsets).
 
   Offset key:   {connector-name} + {stream_id}
@@ -239,27 +281,4 @@
   │  2. Resumes querying CDC log from that cdc$time onwards          │
   │  3. At-least-once delivery (duplicate filtering by consumer)     │
   └──────────────────────────────────────────────────────────────────┘
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  PART 5 — TABLETS ARCHITECTURE NOTE (ScyllaDB 2025.x)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  ScyllaDB 2025.x introduced the tablets storage architecture.
-  Tablets dynamically rebalance token ranges across nodes — unlike
-  the fixed Vnode model the older connector versions were built against.
-
-  ┌────────────────────────────────────────────────────────┐
-  │  Vnode model (pre-2025):  fixed 256 tokens per node    │
-  │    → connector tasks mapped 1:1 to Vnode streams       │
-  │    → predictable, static assignment                    │
-  │                                                        │
-  │  Tablet model (2025.x+):  dynamic token migration      │
-  │    → tablet splits and merges during operation         │
-  │    → CDC stream IDs change on rebalance                │
-  │    → connector MUST be 2.0.x+ to handle this          │
-  └────────────────────────────────────────────────────────┘
-
-  The bootstrap script enforces this: if Maven Central resolves
-  a version below 2.0.0, a red WARNING banner fires and the script
-  pauses for 10 seconds before continuing.
 
