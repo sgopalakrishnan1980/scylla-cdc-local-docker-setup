@@ -1,0 +1,685 @@
+╔══════════════════════════════════════════════════════════════════════════════════════════════════╗
+║                                                                                                  ║
+║   Apache Kafka — Beginner's Guide                                                                ║
+║   High-Level Concepts, Components, and Architecture                                              ║
+║                                                                                                  ║
+╚══════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  WHAT IS KAFKA?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Apache Kafka is a distributed event streaming platform. Think of it as a
+  high-throughput, fault-tolerant pipe that moves data between systems in
+  real time. Originally built at LinkedIn, it is now an Apache open-source
+  project used at thousands of companies worldwide.
+
+  The core idea is simple:
+
+    Producers write events → Kafka stores them → Consumers read them
+
+  What makes Kafka special:
+    • Events are persisted to disk — they survive crashes and restarts
+    • Multiple consumers can independently read the same events
+    • It scales horizontally to millions of events per second
+    • Events are ordered and replayable — you can go back in time
+
+  Official introduction:
+    https://kafka.apache.org/intro
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  CORE CONCEPTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  EVENT (also called a Message or Record)
+  ────────────────────────────────────────
+  The fundamental unit of data in Kafka. An event is an immutable fact — a
+  thing that happened. Every event has:
+
+    ┌──────────────────────────────────────────────────────────────┐
+    │  Key     : optional identifier (used for partitioning)       │
+    │  Value   : the payload — JSON, Avro, Protobuf, plain bytes   │
+    │  Timestamp: when the event occurred                          │
+    │  Headers : optional key-value metadata (e.g. trace IDs)     │
+    └──────────────────────────────────────────────────────────────┘
+
+  Example event (as JSON):
+    Key   : "order-123"
+    Value : {"order_id": "order-123", "status": "SHIPPED", "qty": 2}
+
+  Official docs:
+    https://kafka.apache.org/documentation/#messages
+
+
+  TOPIC
+  ──────
+  A named channel where events of a particular category are stored.
+  Topics are the backbone of Kafka's organisation — everything is
+  written to and read from topics.
+
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                    Topic: "orders"                              │
+    │                                                                 │
+    │  [event1] → [event2] → [event3] → [event4] → [event5] → ...   │
+    │                                                                 │
+    │  Append-only log. New events go to the end. Old events stay.   │
+    └─────────────────────────────────────────────────────────────────┘
+
+  Key properties:
+    • Topics are identified by name (e.g. "orders", "page-views")
+    • Events in a topic are ordered by offset (sequential number)
+    • Topics have a configurable retention period (e.g. 7 days, or forever)
+    • Topics are split into partitions for parallelism
+
+  Official docs:
+    https://kafka.apache.org/documentation/#intro_topics
+
+
+  PARTITION
+  ──────────
+  Topics are divided into partitions — smaller ordered logs that can
+  be spread across multiple brokers. Partitions are what make Kafka
+  scalable and parallel.
+
+    Topic: "orders" with 3 partitions
+
+    Partition 0:  [event-A] → [event-D] → [event-G] ...
+    Partition 1:  [event-B] → [event-E] → [event-H] ...
+    Partition 2:  [event-C] → [event-F] → [event-I] ...
+
+  How events are assigned to partitions:
+    • If the event has a key  → hash(key) % num_partitions
+    • If no key              → round-robin across partitions
+    • Custom partitioner     → your own logic
+
+  Ordering guarantee: events with the same key always go to the same
+  partition, so they are always read in the order they were written.
+
+  Official docs:
+    https://kafka.apache.org/documentation/#intro_topics
+
+
+  OFFSET
+  ───────
+  Every event in a partition has a unique, sequential integer called
+  an offset. Offsets start at 0 and increment by 1 for each new event.
+
+    Partition 0:
+    ┌─────────┬─────────┬─────────┬─────────┬─────────┐
+    │ offset 0│ offset 1│ offset 2│ offset 3│ offset 4│ ...
+    └─────────┴─────────┴─────────┴─────────┴─────────┘
+
+  Consumers track their position using offsets. This means:
+    • A consumer can re-read old events by resetting its offset
+    • If a consumer crashes, it resumes from where it left off
+    • Multiple consumers can read the same partition independently
+
+  Official docs:
+    https://kafka.apache.org/documentation/#theproducer
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  INFRASTRUCTURE COMPONENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌───────────────────────────────────────────────────────────────────────────────────────────┐
+  │                                                                                           │
+  │   PRODUCER          BROKER CLUSTER              CONSUMER GROUP                           │
+  │                                                                                           │
+  │  ┌────────┐       ┌───────────────────┐        ┌───────────────────────────────────┐     │
+  │  │        │       │ ┌─────┐  ┌─────┐  │        │  ┌──────────┐   ┌──────────┐     │     │
+  │  │ App /  │──────►│ │Brkr │  │Brkr │  │──────► │  │Consumer 1│   │Consumer 2│     │     │
+  │  │ Service│       │ │  1  │  │  2  │  │        │  │(reads    │   │(reads    │     │     │
+  │  │        │       │ └─────┘  └─────┘  │        │  │ part 0,1)│   │ part 2)  │     │     │
+  │  └────────┘       │       ┌─────┐     │        │  └──────────┘   └──────────┘     │     │
+  │                   │       │Brkr │     │        └───────────────────────────────────┘     │
+  │                   │       │  3  │     │                                                   │
+  │                   │       └─────┘     │                                                   │
+  │                   └───────────────────┘                                                   │
+  │                           │                                                               │
+  │                    ┌──────┴──────┐                                                        │
+  │                    │   KRaft /   │                                                        │
+  │                    │  ZooKeeper  │  (cluster coordination)                                │
+  │                    └─────────────┘                                                        │
+  └───────────────────────────────────────────────────────────────────────────────────────────┘
+
+
+  BROKER
+  ───────
+  A Kafka broker is a single server in the Kafka cluster. It is responsible
+  for receiving events from producers, storing them on disk, and serving
+  them to consumers.
+
+  Key responsibilities:
+    • Accepting writes from producers
+    • Storing partition data as segment files on disk
+    • Serving reads to consumers
+    • Replicating partition data to other brokers for fault tolerance
+
+  In a cluster:
+    • Each partition has one LEADER broker (handles all reads/writes)
+    • Other brokers hold REPLICAS (hot standbys, take over if leader fails)
+    • One broker is elected the CONTROLLER (manages cluster metadata)
+
+  In this setup (scylla-cdc-bridge):
+    Container : scylla-cdc-broker
+    Image     : confluentinc/cp-kafka (community) or cp-server (enterprise)
+    Listeners : PLAINTEXT :9092 (internal), PLAINTEXT_HOST :9093 (host)
+
+  Official docs:
+    https://kafka.apache.org/documentation/#brokerconfigs
+
+
+  PRODUCER
+  ─────────
+  Any application that writes events to Kafka. Producers are decoupled from
+  consumers — they write without knowing who (if anyone) will read.
+
+  How a producer works:
+    1. Creates a ProducerRecord with topic, optional key, value
+    2. Serializes key and value (JSON, Avro, string, bytes, etc.)
+    3. Partitioner decides which partition to send to
+    4. Events are batched and compressed for efficiency
+    5. Sent to the leader broker of the target partition
+    6. Broker acknowledges (based on acks setting)
+
+  Important producer settings:
+  ┌──────────────────────┬────────────────────────────────────────────────────┐
+  │  acks=0              │ Fire and forget — fastest, no durability guarantee │
+  │  acks=1              │ Leader acknowledges — moderate durability          │
+  │  acks=all            │ All replicas acknowledge — strongest durability    │
+  │  retries             │ How many times to retry on failure                 │
+  │  batch.size          │ How many bytes to batch before sending             │
+  │  linger.ms           │ How long to wait to fill a batch                   │
+  │  compression.type    │ none / gzip / snappy / lz4 / zstd                 │
+  └──────────────────────┴────────────────────────────────────────────────────┘
+
+  Official docs:
+    https://kafka.apache.org/documentation/#producerconfigs
+
+
+  CONSUMER
+  ─────────
+  Any application that reads events from Kafka. Consumers pull events from
+  brokers — Kafka never pushes to consumers.
+
+  How a consumer works:
+    1. Subscribes to one or more topics
+    2. Polls the broker for new events in a loop
+    3. Processes each event (your business logic)
+    4. Commits its offset (marks progress)
+
+  Key concept — at what point to read:
+    auto.offset.reset = earliest  → read from the very beginning of the topic
+    auto.offset.reset = latest    → read only new events written after subscribing
+
+  Official docs:
+    https://kafka.apache.org/documentation/#consumerconfigs
+
+
+  CONSUMER GROUP
+  ───────────────
+  A set of consumers that cooperate to consume a topic in parallel.
+  Kafka automatically divides partitions among the consumers in a group.
+
+    Topic with 3 partitions, Consumer Group with 3 consumers:
+
+    Partition 0 ──► Consumer A   (each consumer owns one partition)
+    Partition 1 ──► Consumer B
+    Partition 2 ──► Consumer C
+
+    Topic with 3 partitions, Consumer Group with 2 consumers:
+
+    Partition 0 ──► Consumer A   (Consumer A gets two partitions)
+    Partition 1 ──► Consumer A
+    Partition 2 ──► Consumer B
+
+  Rules:
+    • One partition is owned by exactly one consumer per group at a time
+    • A topic can be consumed by multiple independent groups simultaneously
+    • If a consumer leaves, Kafka rebalances partition ownership (rebalance)
+    • Each group tracks its own offsets independently
+
+  Official docs:
+    https://kafka.apache.org/documentation/#intro_consumers
+
+
+  REPLICATION
+  ────────────
+  Kafka replicates partition data across multiple brokers to tolerate
+  broker failures without data loss.
+
+    Topic "orders", Partition 0, Replication Factor = 3:
+
+    ┌──────────────┐    replicate    ┌──────────────┐
+    │  Broker 1    │ ─────────────► │  Broker 2    │
+    │  LEADER      │                │  FOLLOWER    │
+    │  (R/W here)  │ ─────────────► │  Broker 3    │
+    └──────────────┘                │  FOLLOWER    │
+                                    └──────────────┘
+
+  If Broker 1 fails, Kafka elects Broker 2 or 3 as the new leader
+  automatically — no data loss, no manual intervention.
+
+  Key settings:
+  ┌────────────────────────────────────┬───────────────────────────────────┐
+  │  replication.factor                │ How many copies of each partition  │
+  │  min.insync.replicas               │ Min replicas that must acknowledge │
+  │  unclean.leader.election.enable    │ Allow out-of-sync replica as leader│
+  └────────────────────────────────────┴───────────────────────────────────┘
+
+  Official docs:
+    https://kafka.apache.org/documentation/#replication
+
+
+  KRAFT (Kafka Raft) — CLUSTER COORDINATION
+  ──────────────────────────────────────────
+  Kafka clusters need something to track metadata: which brokers are alive,
+  which broker leads which partition, topic configurations, etc.
+
+  Historically this was ZooKeeper (a separate system). Since Kafka 3.3,
+  Kafka includes its own built-in consensus mechanism called KRaft (Kafka
+  Raft), removing the ZooKeeper dependency entirely.
+
+  KRaft roles:
+    broker     → stores and serves data
+    controller → manages cluster metadata (replaces ZooKeeper)
+    Both roles can run in the same process (combined mode — used in this setup)
+
+  In this setup:
+    KAFKA_PROCESS_ROLES=broker,controller
+    KAFKA_CONTROLLER_QUORUM_VOTERS=1@scylla-cdc-broker:29093
+
+  Official KRaft docs:
+    https://kafka.apache.org/documentation/#kraft
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  KAFKA CONNECT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Kafka Connect is a framework for moving data between Kafka and external
+  systems without writing custom producer/consumer code. You configure a
+  connector — Kafka Connect runs and manages it.
+
+  Two types of connectors:
+
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  SOURCE CONNECTOR                                                    │
+  │                                                                      │
+  │  External System ──────────────────────────► Kafka Topic             │
+  │  (database, API, file, CDC log)                                      │
+  │                                                                      │
+  │  Example: ScyllaDB CDC Source Connector                              │
+  │           Reads CDC log → publishes to ScyllaCDC.cdc_test.orders     │
+  └──────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  SINK CONNECTOR                                                      │
+  │                                                                      │
+  │  Kafka Topic ──────────────────────────► External System             │
+  │                                          (Snowflake, S3, Elastic)    │
+  │                                                                      │
+  │  Example: Snowflake Sink Connector                                   │
+  │           Reads Kafka topic → writes to Snowflake table              │
+  └──────────────────────────────────────────────────────────────────────┘
+
+  How Connect manages connectors:
+    • Each connector is split into one or more TASKS (parallel workers)
+    • Connect stores connector configs and offsets in internal Kafka topics
+    • REST API at :8083 for managing connectors (CRUD operations)
+    • Connectors are fault-tolerant — tasks restart automatically on failure
+
+  Connector lifecycle:
+    UNASSIGNED → RUNNING → PAUSED / FAILED → (restart) → RUNNING
+
+  Internal topics used by Connect:
+  ┌─────────────────────────────────┬──────────────────────────────────────┐
+  │  connect-configs                │ Connector and task configurations    │
+  │  connect-offsets                │ Source connector progress (offsets)  │
+  │  connect-status                 │ Connector and task status            │
+  └─────────────────────────────────┴──────────────────────────────────────┘
+
+  In this setup:
+    Container : scylla-cdc-connect
+    REST API  : http://localhost:18083
+    Plugins   : /usr/share/confluent-hub-components (Datagen)
+                /connectors (ScyllaDB CDC Source Connector)
+
+  Official docs:
+    https://kafka.apache.org/documentation/#connect
+    https://kafka.apache.org/documentation/#connectconfigs
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SCHEMA REGISTRY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Kafka stores events as raw bytes — it has no built-in understanding of
+  the structure (schema) of your data. Schema Registry solves this.
+
+  What it does:
+    • Stores Avro / Protobuf / JSON Schema definitions centrally
+    • Assigns each schema a unique integer ID
+    • Producers embed just the schema ID in each event (not the full schema)
+    • Consumers look up the schema by ID to deserialise correctly
+    • Enforces schema compatibility rules on evolution
+
+  Event wire format with Schema Registry (Avro):
+  ┌──────┬──────────────┬────────────────────────────────┐
+  │ 0x00 │  Schema ID   │  Avro-encoded payload           │
+  │(1 byte) (4 bytes)  │  (compact binary, no field names)│
+  └──────┴──────────────┴────────────────────────────────┘
+
+  Schema compatibility modes:
+  ┌──────────────────────┬────────────────────────────────────────────────┐
+  │  BACKWARD (default)  │ New schema can read data written with old schema│
+  │  FORWARD             │ Old schema can read data written with new schema│
+  │  FULL                │ Both backward and forward compatible            │
+  │  NONE                │ No compatibility checks                         │
+  └──────────────────────┴────────────────────────────────────────────────┘
+
+  In this setup:
+    Container : scylla-cdc-schema-registry
+    REST API  : http://localhost:18081
+    Stores schemas in the _schemas internal Kafka topic
+
+  Useful API calls:
+    # List all subjects (schema families)
+    curl http://localhost:18081/subjects
+
+    # Get schema versions for a subject
+    curl http://localhost:18081/subjects/orders-value/versions
+
+    # Get a specific schema by ID
+    curl http://localhost:18081/schemas/ids/1
+
+  Official docs (Confluent):
+    https://docs.confluent.io/platform/current/schema-registry/index.html
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  KAFKA REST PROXY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  A RESTful HTTP interface to Kafka. Useful for languages without a native
+  Kafka client, quick testing, or integration with HTTP-based systems.
+
+  What you can do:
+    • Produce events via HTTP POST
+    • Consume events via HTTP GET
+    • Inspect topic metadata
+    • Manage consumer instances
+
+  Example — produce a message:
+    curl -X POST http://localhost:18082/topics/orders \
+      -H "Content-Type: application/vnd.kafka.json.v2+json" \
+      -d '{"records": [{"key": "order-1", "value": {"status": "PENDING"}}]}'
+
+  Example — get topic metadata:
+    curl http://localhost:18082/topics/orders
+
+  In this setup:
+    Container : scylla-cdc-rest-proxy
+    REST API  : http://localhost:18082
+
+  Official docs:
+    https://docs.confluent.io/platform/current/kafka-rest/api.html
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ksqlDB
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ksqlDB lets you write SQL-like queries that run continuously over Kafka
+  topics in real time. No Spark or Flink needed for common stream processing
+  patterns.
+
+  Two query types:
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  PUSH QUERY                                                          │
+  │  Runs forever, emitting results as new events arrive                 │
+  │  SELECT * FROM orders EMIT CHANGES;                                  │
+  └──────────────────────────────────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  PULL QUERY                                                          │
+  │  Point-in-time lookup against a materialised view                    │
+  │  SELECT * FROM orders_by_status WHERE status = 'PENDING';            │
+  └──────────────────────────────────────────────────────────────────────┘
+
+  Useful for:
+    • Real-time aggregations (count orders per minute)
+    • Filtering (route SHIPPED events to a new topic)
+    • Joins (enrich orders with customer data)
+    • Anomaly detection (flag orders over $10,000)
+
+  Example — create a stream over a Kafka topic:
+    CREATE STREAM orders_stream (
+      order_id VARCHAR KEY,
+      customer VARCHAR,
+      status   VARCHAR,
+      quantity INT
+    ) WITH (
+      KAFKA_TOPIC='ScyllaCDC.cdc_test.orders',
+      VALUE_FORMAT='JSON'
+    );
+
+  Example — continuous count of orders per status:
+    SELECT status, COUNT(*) AS total
+    FROM orders_stream
+    GROUP BY status
+    EMIT CHANGES;
+
+  In this setup:
+    Container : scylla-cdc-ksqldb
+    REST API  : http://localhost:18088
+
+  Official docs:
+    https://kafka.apache.org/documentation/#streams
+    https://docs.confluent.io/platform/current/ksqldb/overview.html
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  COMPLETE ARCHITECTURE MAP — THIS SETUP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌──────────────────────────────────────────────────────────────────────────────────────┐
+  │                         scylla-cdc-bridge (Docker network)                          │
+  │                                                                                      │
+  │  ┌──────────────────────────────────────┐                                           │
+  │  │        ScyllaDB Cluster              │                                           │
+  │  │  node1 ◄──gossip──► node2 ◄──► node3│                                           │
+  │  │  CQL :9042 on each node              │                                           │
+  │  └──────────────────────┬───────────────┘                                           │
+  │                         │ CDC log read (CQL)                                         │
+  │                         ▼                                                            │
+  │  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+  │  │  Kafka Connect  (scylla-cdc-connect :8083)                                   │   │
+  │  │                                                                              │   │
+  │  │   ScyllaDB CDC Source Connector  ←── JAR from /connectors (Maven Central)   │   │
+  │  │   Datagen Source Connector       ←── installed via confluent-hub             │   │
+  │  └───────────────────────────┬──────────────────────────────────────────────────┘   │
+  │                              │ produce events                                        │
+  │                              ▼                                                        │
+  │  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+  │  │  Kafka Broker  (scylla-cdc-broker :9092 internal, :9093 host)                │   │
+  │  │  KRaft controller embedded                                                   │   │
+  │  │                                                                              │   │
+  │  │  Topics:  ScyllaCDC.cdc_test.orders   pageviews   users   _schemas  ...      │   │
+  │  └───┬──────────────────┬────────────────────────┬────────────────────────────┘    │
+  │      │                  │                         │                                  │
+  │      ▼                  ▼                         ▼                                  │
+  │  ┌────────────┐  ┌──────────────┐  ┌─────────────────────┐  ┌──────────────────┐  │
+  │  │  Schema    │  │  REST Proxy  │  │  ksqlDB             │  │  Web UI          │  │
+  │  │  Registry  │  │  :8082       │  │  :8088              │  │  Kafdrop  :9000  │  │
+  │  │  :8081     │  │              │  │  SQL over streams    │  │  Control  :9021  │  │
+  │  │  Avro/JSON │  │  HTTP → Kafka│  │  real-time analytics │  │  Center          │  │
+  │  └────────────┘  └──────────────┘  └─────────────────────┘  └──────────────────┘  │
+  └──────────────────────────────────────────────────────────────────────────────────────┘
+
+  Host access (all via 1xxxx ports to avoid conflicts):
+    Broker       → localhost:19093
+    Schema Reg   → localhost:18081
+    Connect REST → localhost:18083
+    REST Proxy   → localhost:18082
+    ksqlDB       → localhost:18088
+    Kafdrop      → localhost:19000  (community)
+    Control Ctr  → localhost:19021  (enterprise)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  KEY KAFKA GUARANTEES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌──────────────────────────────────────────────────────────────────────────────────┐
+  │  Ordering     Events with the same key always go to the same partition, so      │
+  │               they are consumed in the order they were produced.                 │
+  │                                                                                  │
+  │  Durability   With acks=all and replication.factor ≥ 2, events survive broker   │
+  │               failures without data loss.                                        │
+  │                                                                                  │
+  │  Delivery     At-least-once by default. Exactly-once is achievable with          │
+  │               idempotent producers + transactions (producer.idempotence=true).   │
+  │                                                                                  │
+  │  Retention    Events are not deleted after consumption. Retention is time-based  │
+  │               (retention.ms) or size-based (retention.bytes). Consumers can      │
+  │               re-read historical events at any time.                             │
+  │                                                                                  │
+  │  Scalability  Add partitions and brokers to scale throughput linearly.           │
+  │               Kafka handles millions of events per second per broker.            │
+  └──────────────────────────────────────────────────────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  COMMON OPERATIONS — QUICK REFERENCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  All commands run inside the broker container or from the host via the
+  Kafka CLI tools bundled with the broker image.
+
+  # List all topics
+  docker exec scylla-cdc-broker kafka-topics \
+    --bootstrap-server localhost:9092 --list
+
+  # Create a topic
+  docker exec scylla-cdc-broker kafka-topics \
+    --bootstrap-server localhost:9092 \
+    --create --topic my-topic --partitions 3 --replication-factor 1
+
+  # Describe a topic (partitions, leader, replicas)
+  docker exec scylla-cdc-broker kafka-topics \
+    --bootstrap-server localhost:9092 \
+    --describe --topic my-topic
+
+  # Produce test messages interactively
+  docker exec -it scylla-cdc-broker kafka-console-producer \
+    --bootstrap-server localhost:9092 --topic my-topic
+
+  # Consume messages from the beginning
+  docker exec scylla-cdc-broker kafka-console-consumer \
+    --bootstrap-server localhost:9092 \
+    --topic my-topic --from-beginning
+
+  # Check consumer group lag
+  docker exec scylla-cdc-broker kafka-consumer-groups \
+    --bootstrap-server localhost:9092 \
+    --describe --all-groups
+
+  # List registered Kafka Connect connectors
+  curl -s http://localhost:18083/connectors | python3 -m json.tool
+
+  # Check connector status
+  curl -s http://localhost:18083/connectors/scylla-cdc-orders/status \
+    | python3 -m json.tool
+
+  # List Schema Registry subjects
+  curl -s http://localhost:18081/subjects
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  FURTHER READING — OFFICIAL APACHE KAFKA DOCUMENTATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Start here:
+    Introduction to Kafka
+      https://kafka.apache.org/intro
+
+    Quickstart (run Kafka locally in minutes)
+      https://kafka.apache.org/quickstart
+
+    Full Documentation Index
+      https://kafka.apache.org/documentation/
+
+  Core concepts:
+    Topics, Partitions, Offsets
+      https://kafka.apache.org/documentation/#intro_topics
+
+    Producers
+      https://kafka.apache.org/documentation/#producerconfigs
+
+    Consumers and Consumer Groups
+      https://kafka.apache.org/documentation/#consumerconfigs
+
+    Replication and Fault Tolerance
+      https://kafka.apache.org/documentation/#replication
+
+    KRaft (Kafka without ZooKeeper)
+      https://kafka.apache.org/documentation/#kraft
+
+  Kafka Connect:
+    Connect Overview
+      https://kafka.apache.org/documentation/#connect
+
+    Connect Configuration Reference
+      https://kafka.apache.org/documentation/#connectconfigs
+
+    Connect REST API
+      https://kafka.apache.org/documentation/#connect_rest
+
+  Kafka Streams (stream processing in Java):
+    Streams Overview
+      https://kafka.apache.org/documentation/streams/
+
+    Streams Developer Guide
+      https://kafka.apache.org/documentation/streams/developer-guide/
+
+  Configuration reference:
+    Broker Configuration
+      https://kafka.apache.org/documentation/#brokerconfigs
+
+    Topic Configuration
+      https://kafka.apache.org/documentation/#topicconfigs
+
+    Producer Configuration
+      https://kafka.apache.org/documentation/#producerconfigs
+
+    Consumer Configuration
+      https://kafka.apache.org/documentation/#consumerconfigs
+
+  Security:
+    Security Overview
+      https://kafka.apache.org/documentation/#security
+
+    Encryption (TLS)
+      https://kafka.apache.org/documentation/#encryption
+
+    Authentication (SASL)
+      https://kafka.apache.org/documentation/#security_sasl
+
+  Operations:
+    Running Kafka in Production
+      https://kafka.apache.org/documentation/#operations
+
+    Monitoring
+      https://kafka.apache.org/documentation/#monitoring
+
+    Hardware and OS recommendations
+      https://kafka.apache.org/documentation/#hwandos
+
+  API Reference:
+    Producer API (Java)
+      https://kafka.apache.org/documentation/#producerapi
+
+    Consumer API (Java)
+      https://kafka.apache.org/documentation/#consumerapi
+
+    Admin API (Java)
+      https://kafka.apache.org/documentation/#adminapi
+
+    Connect API (Java)
+      https://kafka.apache.org/documentation/#connectapi
+
+  Release notes and upgrade guides:
+    https://kafka.apache.org/downloads
+

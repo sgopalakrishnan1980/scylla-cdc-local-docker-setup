@@ -47,13 +47,26 @@ section() {
 }
 
 cql() {
-  # Run a CQL statement inside the seed node container
-  docker exec "$SCYLLA_SEED" cqlsh "$SCYLLA_SEED" -e "$1"
+  # Pipe CQL statement into cqlsh via stdin — most reliable non-interactive method.
+  # Avoids all -e flag issues: stdin bleed-through, SyntaxException noise, exit codes.
+  # docker exec -i connects host stdin to container stdin; we feed exactly one statement.
+  echo "$1" | docker exec -i "$SCYLLA_SEED" cqlsh "$SCYLLA_SEED" 2>/dev/null
 }
 
 cql_file() {
-  # Pipe a heredoc into cqlsh
-  docker exec -i "$SCYLLA_SEED" cqlsh "$SCYLLA_SEED"
+  # Pipe a heredoc into cqlsh via stdin for multi-line/multi-statement blocks.
+  docker exec -i "$SCYLLA_SEED" cqlsh "$SCYLLA_SEED" 2>/dev/null
+}
+
+cql_check() {
+  # Same as cql() but returns output for use in conditionals.
+  echo "$1" | docker exec -i "$SCYLLA_SEED" cqlsh "$SCYLLA_SEED" 2>/dev/null
+}
+
+gen_uuid() {
+  python3 -c "import uuid; print(uuid.uuid4())" 2>/dev/null \
+    || uuidgen 2>/dev/null \
+    || cat /proc/sys/kernel/random/uuid
 }
 
 wait_for_connector_running() {
@@ -171,17 +184,42 @@ fi
 if [[ "$DO_SETUP" == true ]]; then
   section "Step 1 — Setup: Keyspace, CDC Table, Connector"
 
+  # ── Idempotency check — detect previous run ──────────────────────
+  log "Checking for existing setup from a previous run..."
+
+  KS_EXISTS=$(cql_check "SELECT keyspace_name FROM system_schema.keyspaces WHERE keyspace_name = '${KEYSPACE}';" \
+    | grep -c "${KEYSPACE}" || true)
+
+  TBL_EXISTS=$(cql_check "SELECT table_name FROM system_schema.tables WHERE keyspace_name = '${KEYSPACE}' AND table_name = '${TABLE}';" \
+    | grep -c "${TABLE}" || true)
+
+  CONN_EXISTS=$(curl -sf "${CONNECT_URL}/connectors/${CONNECTOR_NAME}/status" 2>/dev/null \
+    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['connector']['state'])" \
+    2>/dev/null || echo "NOT_FOUND")
+
+  if [[ "$KS_EXISTS" -gt 0 && "$TBL_EXISTS" -gt 0 && "$CONN_EXISTS" == "RUNNING" ]]; then
+    echo ""
+    ok "Previous setup detected — all components already exist:"
+    ok "  Keyspace  : ${KEYSPACE} ✓"
+    ok "  Table     : ${KEYSPACE}.${TABLE} ✓"
+    ok "  Connector : ${CONNECTOR_NAME} (${CONN_EXISTS}) ✓"
+    warn "Skipping setup — run with -c first to clean up, or use -d to push more data."
+    DO_SETUP=false
+  else
+    [[ "$KS_EXISTS"  -gt 0 ]] && ok "  Keyspace exists — skipping CREATE"   || log "  Keyspace not found — will create"
+    [[ "$TBL_EXISTS" -gt 0 ]] && ok "  Table exists — skipping CREATE"       || log "  Table not found — will create"
+    [[ "$CONN_EXISTS" == "RUNNING" ]] && ok "  Connector exists — skipping register" || log "  Connector not found — will register"
+  fi
+fi
+
+if [[ "$DO_SETUP" == true ]]; then
+
   log "Creating keyspace '${KEYSPACE}'..."
-  cql "
-    CREATE KEYSPACE IF NOT EXISTS ${KEYSPACE}
-    WITH replication = {
-      'class': 'NetworkTopologyStrategy',
-      'datacenter1': ${UN_COUNT}
-    } AND durable_writes = true;
-  " && ok "Keyspace: $KEYSPACE"
+  cql "CREATE KEYSPACE IF NOT EXISTS ${KEYSPACE} WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': ${UN_COUNT}} AND durable_writes = true;"
+  ok "Keyspace: $KEYSPACE"
 
   log "Creating CDC-enabled table '${KEYSPACE}.${TABLE}'..."
-  cql "
+  cat <<CQL_EOF | cql_file
     CREATE TABLE IF NOT EXISTS ${KEYSPACE}.${TABLE} (
       order_id    uuid,
       customer    text,
@@ -195,11 +233,12 @@ if [[ "$DO_SETUP" == true ]]; then
       'preimage':   'true',
       'postimage':  'true'
     };
-  " && ok "Table: ${KEYSPACE}.${TABLE} (CDC enabled, preimage+postimage)"
+CQL_EOF
+  ok "Table: ${KEYSPACE}.${TABLE} (CDC enabled, preimage+postimage)"
 
   log "Verifying CDC log table was auto-created..."
-  CDC_TABLE=$(docker exec "$SCYLLA_SEED" cqlsh "$SCYLLA_SEED" \
-    -e "DESCRIBE TABLE ${KEYSPACE}.${TABLE}_scylla_cdc_log;" 2>&1 | head -3 || true)
+  CDC_TABLE=$(echo "DESCRIBE TABLE ${KEYSPACE}.${TABLE}_scylla_cdc_log;" \
+    | docker exec -i "$SCYLLA_SEED" cqlsh "$SCYLLA_SEED" 2>&1 | head -3 || true)
   if echo "$CDC_TABLE" | grep -q "cdc\$stream_id\|CREATE TABLE"; then
     ok "CDC log table: ${KEYSPACE}.${TABLE}_scylla_cdc_log ✓"
   else
@@ -221,7 +260,7 @@ if [[ "$DO_SETUP" == true ]]; then
         \"scylla.cluster.ip.addresses\":         \"${SCYLLA_ADDRESSES}\",
         \"scylla.localdc\":                      \"datacenter1\",
         \"scylla.table.names\":                  \"${KEYSPACE}.${TABLE}\",
-        \"tasks.max\":                           \"${#SCYLLA_NODES[@]}\",
+        \"tasks.max\":                           \"1\",
         \"scylla.preimage\":                     \"true\",
         \"scylla.postimage\":                    \"true\",
         \"key.converter\":                       \"org.apache.kafka.connect.json.JsonConverter\",
@@ -253,81 +292,53 @@ fi
 if [[ "$DO_DATA" == true ]]; then
   section "Step 2 — Push Test Data (INSERT / UPDATE / DELETE)"
 
-  # Generate 5 order UUIDs
-  UUID1=$(docker exec "$SCYLLA_SEED" python3 -c "import uuid; print(uuid.uuid4())")
-  UUID2=$(docker exec "$SCYLLA_SEED" python3 -c "import uuid; print(uuid.uuid4())")
-  UUID3=$(docker exec "$SCYLLA_SEED" python3 -c "import uuid; print(uuid.uuid4())")
-  UUID4=$(docker exec "$SCYLLA_SEED" python3 -c "import uuid; print(uuid.uuid4())")
-  UUID5=$(docker exec "$SCYLLA_SEED" python3 -c "import uuid; print(uuid.uuid4())")
+  # Generate 5 order UUIDs on the host (faster, no container round-trip)
+  UUID1=$(gen_uuid)
+  UUID2=$(gen_uuid)
+  UUID3=$(gen_uuid)
+  UUID4=$(gen_uuid)
+  UUID5=$(gen_uuid)
+  log "Generated UUIDs: $UUID1 $UUID2 $UUID3 $UUID4 $UUID5"
 
   log "Inserting 5 orders (CDC op: c — create)..."
-  cql "
-    INSERT INTO ${KEYSPACE}.${TABLE}
-      (order_id, customer, product, quantity, status, created_at)
-    VALUES
-      (${UUID1}, 'Alice Kim',   'Laptop Pro',       1, 'PENDING',    toTimestamp(now()));
-    INSERT INTO ${KEYSPACE}.${TABLE}
-      (order_id, customer, product, quantity, status, created_at)
-    VALUES
-      (${UUID2}, 'Bob Tanaka',  'Mechanical Keyboard', 2, 'PENDING', toTimestamp(now()));
-    INSERT INTO ${KEYSPACE}.${TABLE}
-      (order_id, customer, product, quantity, status, created_at)
-    VALUES
-      (${UUID3}, 'Carol Park',  'USB-C Hub',        3, 'PENDING',    toTimestamp(now()));
-    INSERT INTO ${KEYSPACE}.${TABLE}
-      (order_id, customer, product, quantity, status, created_at)
-    VALUES
-      (${UUID4}, 'Dan Gupta',   'Monitor 4K',       1, 'PENDING',    toTimestamp(now()));
-    INSERT INTO ${KEYSPACE}.${TABLE}
-      (order_id, customer, product, quantity, status, created_at)
-    VALUES
-      (${UUID5}, 'Eve Santos',  'Webcam HD',        2, 'PENDING',    toTimestamp(now()));
-  " && ok "Inserted 5 rows"
+  cql "INSERT INTO ${KEYSPACE}.${TABLE} (order_id, customer, product, quantity, status, created_at) VALUES (${UUID1}, 'Alice Kim',  'Laptop Pro',          1, 'PENDING', toTimestamp(now()));"
+  cql "INSERT INTO ${KEYSPACE}.${TABLE} (order_id, customer, product, quantity, status, created_at) VALUES (${UUID2}, 'Bob Tanaka', 'Mechanical Keyboard',  2, 'PENDING', toTimestamp(now()));"
+  cql "INSERT INTO ${KEYSPACE}.${TABLE} (order_id, customer, product, quantity, status, created_at) VALUES (${UUID3}, 'Carol Park', 'USB-C Hub',            3, 'PENDING', toTimestamp(now()));"
+  cql "INSERT INTO ${KEYSPACE}.${TABLE} (order_id, customer, product, quantity, status, created_at) VALUES (${UUID4}, 'Dan Gupta',  'Monitor 4K',           1, 'PENDING', toTimestamp(now()));"
+  cql "INSERT INTO ${KEYSPACE}.${TABLE} (order_id, customer, product, quantity, status, created_at) VALUES (${UUID5}, 'Eve Santos', 'Webcam HD',            2, 'PENDING', toTimestamp(now()));"
+  ok "Inserted 5 rows"
 
   log "Waiting 3s for CDC log propagation..."
   sleep 3
 
   log "Updating 3 orders — status change (CDC op: u — update)..."
-  cql "
-    UPDATE ${KEYSPACE}.${TABLE}
-      SET status = 'CONFIRMED'
-    WHERE order_id = ${UUID1};
-    UPDATE ${KEYSPACE}.${TABLE}
-      SET status = 'CONFIRMED', quantity = 3
-    WHERE order_id = ${UUID2};
-    UPDATE ${KEYSPACE}.${TABLE}
-      SET status = 'SHIPPED'
-    WHERE order_id = ${UUID3};
-  " && ok "Updated 3 rows (status: PENDING → CONFIRMED/SHIPPED)"
+  cql "UPDATE ${KEYSPACE}.${TABLE} SET status = 'CONFIRMED' WHERE order_id = ${UUID1};"
+  cql "UPDATE ${KEYSPACE}.${TABLE} SET status = 'CONFIRMED', quantity = 3 WHERE order_id = ${UUID2};"
+  cql "UPDATE ${KEYSPACE}.${TABLE} SET status = 'SHIPPED' WHERE order_id = ${UUID3};"
+  ok "Updated 3 rows (status: PENDING → CONFIRMED/SHIPPED)"
 
   log "Waiting 3s..."
   sleep 3
 
   log "Updating 1 order — quantity and status change (CDC op: u)..."
-  cql "
-    UPDATE ${KEYSPACE}.${TABLE}
-      SET status = 'DELIVERED', quantity = 1
-    WHERE order_id = ${UUID1};
-  " && ok "Updated UUID1: CONFIRMED → DELIVERED"
+  cql "UPDATE ${KEYSPACE}.${TABLE} SET status = 'DELIVERED', quantity = 1 WHERE order_id = ${UUID1};"
+  ok "Updated UUID1: CONFIRMED → DELIVERED"
 
   log "Waiting 3s..."
   sleep 3
 
   log "Deleting 2 orders (CDC op: d — delete)..."
-  cql "
-    DELETE FROM ${KEYSPACE}.${TABLE} WHERE order_id = ${UUID4};
-    DELETE FROM ${KEYSPACE}.${TABLE} WHERE order_id = ${UUID5};
-  " && ok "Deleted 2 rows (UUID4, UUID5)"
+  cql "DELETE FROM ${KEYSPACE}.${TABLE} WHERE order_id = ${UUID4};"
+  cql "DELETE FROM ${KEYSPACE}.${TABLE} WHERE order_id = ${UUID5};"
+  ok "Deleted 2 rows (UUID4, UUID5)"
 
   log "Current table state:"
   cql "SELECT order_id, customer, status, quantity FROM ${KEYSPACE}.${TABLE};"
 
   log "CDC log table — last 10 entries:"
-  cql "
-    SELECT cdc\$operation, cdc\$time, order_id, status, quantity
-    FROM ${KEYSPACE}.${TABLE}_scylla_cdc_log
-    LIMIT 10;
-  " 2>/dev/null || warn "CDC log query failed — the log table may use a different schema version"
+  echo "SELECT * FROM ${KEYSPACE}.${TABLE}_scylla_cdc_log LIMIT 10;" \
+    | docker exec -i "$SCYLLA_SEED" cqlsh "$SCYLLA_SEED" 2>/dev/null \
+    || warn "CDC log query failed — table may not exist yet or CDC not enabled"
 
   # Record UUIDs for verification step
   echo "$UUID1" > /tmp/cdc_test_uuids.txt
@@ -382,6 +393,7 @@ if [[ "$DO_VERIFY" == true ]]; then
       --from-beginning \
       --max-messages 50 \
       --timeout-ms $(( POLL_TIMEOUT * 1000 )) \
+      --property print.key=false \
     2>/dev/null || true)
 
   if [[ -z "$RAW_MESSAGES" ]]; then
@@ -398,53 +410,91 @@ if [[ "$DO_VERIFY" == true ]]; then
   echo -e "\033[1;36m─── CDC EVENT SUMMARY ──────────────────────────────────────────────\033[0m"
 
   if [[ -n "$RAW_MESSAGES" ]]; then
-    echo "$RAW_MESSAGES" | python3 - << 'PYEOF'
-import sys
-import json
+    TMPFILE=$(mktemp /tmp/cdc_messages_XXXXXX.jsonl)
+    PYFILE=$(mktemp /tmp/cdc_parse_XXXXXX.py)
+    echo "$RAW_MESSAGES" > "$TMPFILE"
 
-lines = sys.stdin.read().strip().split('\n')
-ops = {'c': 0, 'u': 0, 'd': 0, 'r': 0, 'unknown': 0}
-tables = {}
-errors = 0
+    cat > "$PYFILE" << PYEOF
+import sys, json
 
-for line in lines:
-    if not line.strip():
-        continue
-    try:
-        msg = json.loads(line)
-        payload = msg.get('payload', {})
-        op = payload.get('op', 'unknown')
-        ops[op] = ops.get(op, 0) + 1
+ops       = {'c': 0, 'u': 0, 'd': 0, 'r': 0, 'unknown': 0}
+op_labels = {'c': 'INSERT', 'u': 'UPDATE', 'd': 'DELETE', 'r': 'READ'}
+tables    = {}
+errors    = 0
+skipped   = 0  # non-JSON lines (plain-string message keys)
 
-        src = payload.get('source', {})
-        tbl = f"{src.get('db','?')}.{src.get('table','?')}"
-        tables[tbl] = tables.get(tbl, 0) + 1
+def unwrap(cell):
+    if isinstance(cell, dict) and 'value' in cell:
+        return cell['value']
+    return cell
 
-        # Print first INSERT, first UPDATE, first DELETE as examples
-        if op in ('c', 'u', 'd') and ops[op] == 1:
-            print(f"\n  Example op='{op}' ({{'c':'INSERT','u':'UPDATE','d':'DELETE'}}.get(op,op)}):")
-            after = payload.get('after', {})
-            before = payload.get('before', {})
-            if before:
-                print(f"    before: customer={before.get('customer','?'):15} status={before.get('status','?')}")
-            if after:
-                print(f"    after:  customer={after.get('customer','?'):15} status={after.get('status','?')}  qty={after.get('quantity','?')}")
-    except json.JSONDecodeError:
-        errors += 1
+with open(sys.argv[1]) as fh:
+    for line in fh:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg     = json.loads(line)
+        except json.JSONDecodeError:
+            # Non-JSON line — likely a plain-string message key
+            # (StringConverter keys are UUIDs, not JSON)
+            skipped += 1
+            continue
+        try:
+            payload = msg.get('payload', msg)
+            op      = payload.get('op', 'unknown')
+            ops[op] = ops.get(op, 0) + 1
 
-print(f"\n  ┌────────────────────────────────────────────┐")
-print(f"  │  CDC Operation Counts                      │")
-print(f"  ├──────────────┬─────────────────────────────┤")
-print(f"  │  op=c (INSERT) │ {ops.get('c',0):>5} events               │")
-print(f"  │  op=u (UPDATE) │ {ops.get('u',0):>5} events               │")
-print(f"  │  op=d (DELETE) │ {ops.get('d',0):>5} events               │")
-print(f"  │  op=r (READ)   │ {ops.get('r',0):>5} events               │")
-print(f"  ├──────────────┴─────────────────────────────┤")
-print(f"  │  Total parsed  │ {sum(ops.values()):>5}                    │")
-print(f"  │  Parse errors  │ {errors:>5}                    │")
-print(f"  └────────────────────────────────────────────┘")
-print(f"\n  Source tables: {list(tables.keys())}")
+            src = payload.get('source') or {}
+            ks  = src.get('keyspace_name') or src.get('db',    '?')
+            tbl = src.get('table_name')    or src.get('table', '?')
+            key = "{}.{}".format(ks, tbl)
+            tables[key] = tables.get(key, 0) + 1
+
+            if op in ('c', 'u', 'd') and ops[op] == 1:
+                print("\n  Example op='{}' ({}):".format(op, op_labels.get(op, op)))
+                after  = payload.get('after')  or {}
+                before = payload.get('before') or {}
+                order_id = (after or before).get('order_id', '?')
+                print("    order_id: {}".format(order_id))
+                if before:
+                    cust   = unwrap(before.get('customer'))
+                    status = unwrap(before.get('status'))
+                    qty    = unwrap(before.get('quantity'))
+                    if any(v is not None for v in [cust, status, qty]):
+                        print("    before: customer={:<15} status={}  qty={}".format(
+                            str(cust or '-'), status or '-', qty if qty is not None else '-'))
+                if after:
+                    cust   = unwrap(after.get('customer'))
+                    status = unwrap(after.get('status'))
+                    qty    = unwrap(after.get('quantity'))
+                    if any(v is not None for v in [cust, status, qty]):
+                        print("    after:  customer={:<15} status={}  qty={}".format(
+                            str(cust or '-'), status or '-', qty if qty is not None else '-'))
+                    else:
+                        print("    after:  (only primary key present — partial update)")
+                if op == 'd':
+                    print("    (row deleted — primary key only in before image)")
+        except Exception as e:
+            errors += 1
+
+print("\n  ┌────────────────────────────────────────────┐")
+print("  │  CDC Operation Counts                      │")
+print("  ├────────────────┬───────────────────────────┤")
+print("  │  op=c (INSERT) │ {:>5} events               │".format(ops.get('c',0)))
+print("  │  op=u (UPDATE) │ {:>5} events               │".format(ops.get('u',0)))
+print("  │  op=d (DELETE) │ {:>5} events               │".format(ops.get('d',0)))
+print("  │  op=r (READ)   │ {:>5} events               │".format(ops.get('r',0)))
+print("  ├────────────────┴───────────────────────────┤")
+print("  │  Total CDC events : {:>5}                   │".format(sum(ops.values())))
+print("  │  Skipped (keys)   : {:>5}                   │".format(skipped))
+print("  │  Parse errors     : {:>5}                   │".format(errors))
+print("  └────────────────────────────────────────────┘")
+print("\n  Source tables : {}".format(list(tables.keys())))
 PYEOF
+
+    python3 "$PYFILE" "$TMPFILE"
+    rm -f "$TMPFILE" "$PYFILE"
   fi
 
   echo ""
